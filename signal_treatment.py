@@ -1,4 +1,6 @@
 import os
+import time
+from typing import Optional
 import numpy as np
 import pandas as pd
 from fractions import Fraction
@@ -95,35 +97,74 @@ def extract_spectral_distribution(
 
 
 def extract_spectrum_multiple_files(
-    audio_files: list[AudioFile],
-    t0,
-    t1,
-    seconds_per_minute=10.0,
-    fmax=1000.0,
+    audio_files: list[AudioFile | str],
+    t0: pd.Timestamp,
+    t1: pd.Timestamp,
+    store=None,
+    seconds_per_minute: float = 10.0,
+    fmax: float = 1000.0,
     tf=None,
-    gain_db=0.0,
-) -> np.ndarray[pd.Timestamp]:
-    times: list[pd.Timestamp]=[]
-    rows:list[np.ndarray[float]] = []
+    gain_db: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Spectra of several files over [t0, t1], merged and sorted by time.
+
+    `audio_files` may hold AudioFile objects or bucket paths; paths are opened
+    one at a time with `store` (a GCStore) and closed right after, so only one
+    GCS stream is open at once. Files with no audio in the window are skipped.
+    Returns (times as datetime64[ns], freqs, psd of shape (n_times, n_freqs), calibrated).
+    """
+    times: list[pd.Timestamp] = []
+    rows: list[np.ndarray] = []
     freqs = None
+    n = len(audio_files)
+    skipped: list[str] = []
+    t_start = time.perf_counter()
+    logger.info(
+        "Extracting spectra from %d file(s) between %s and %s (%.0f s/min, fmax=%.0f Hz)",
+        n, t0, t1, seconds_per_minute, fmax,
+    )
     for i, p in enumerate(audio_files):
-        tms, frqs, rws = extract_spectral_distribution(
-            audio_file=p,
-            t0=t0,
-            t1=t1,
-            seconds_per_minute=seconds_per_minute,
-            fmax=fmax,
-            tf=tf,
-            gain_db=gain_db,
+        name = os.path.basename(p if isinstance(p, str) else p.filename)
+        t_file = time.perf_counter()
+        logger.debug("[%d/%d] opening %s", i + 1, n, name)
+        if isinstance(p, str):
+            if store is None:
+                raise ValueError("pass `store` when audio_files contains paths")
+            p = AudioFile(filename=p, store=store)
+        try:
+            tms, frqs, rws = extract_spectral_distribution(
+                audio_file=p,
+                t0=t0,
+                t1=t1,
+                seconds_per_minute=seconds_per_minute,
+                fmax=fmax,
+            )
+        except Exception:
+            logger.exception("[%d/%d] %s: extraction failed", i + 1, n, name)
+            raise
+        finally:
+            p.close()  # free the GCS stream; read() reopens it if needed later
+        elapsed = time.perf_counter() - t_file
+        if not rws:
+            skipped.append(name)
+            logger.warning("[%d/%d] %s: no audio in window, skipped (%.1f s)", i + 1, n, name, elapsed)
+            continue
+        logger.info(
+            "[%d/%d] %s: %d minute(s), %s -> %s (%.1f s)",
+            i + 1, n, name, len(rws), tms[0], tms[-1], elapsed,
         )
-        p.close()  # free the GCS stream; read() reopens it if needed later
-        logger.info("  [%d/%d]", i + 1, len(audio_files))
-        times += tms
-        rows += rws
         if freqs is None:
             freqs = frqs
+        elif len(frqs) != len(freqs) or not np.allclose(frqs, freqs):
+            raise ValueError(
+                f"{p.filename}: frequency grid differs from previous files "
+                f"({len(frqs)} vs {len(freqs)} bins); sample rate below 2*fmax?"
+            )
+        times += tms
+        rows += rws
     if not rows:
-        raise SystemExit("No audio inside the requested time window.")
+        logger.error("No audio between %s and %s in %d file(s)", t0, t1, n)
+        raise ValueError(f"No audio between {t0} and {t1} in {n} file(s).")
     order = np.argsort(np.array(times, dtype="datetime64[ns]"))
     t = np.array(times, dtype="datetime64[ns]")[order]
     psd = np.vstack(rows)[order]
@@ -131,6 +172,13 @@ def extract_spectrum_multiple_files(
     cal = load_calibration(tf, freqs, gain_db)
     psd = (psd + cal).astype(np.float32)
     calibrated = bool(tf) or bool(gain_db)
+    logger.info(
+        "Done: %d spectra x %d bins from %d/%d file(s)%s, %s, %.1f s total",
+        psd.shape[0], psd.shape[1], n - len(skipped), n,
+        f" ({len(skipped)} skipped)" if skipped else "",
+        "calibrated" if calibrated else "uncalibrated",
+        time.perf_counter() - t_start,
+    )
     return t, freqs.astype(np.float32), psd, calibrated
 
 
@@ -192,3 +240,25 @@ def plot_bands_timeserie(times: list[pd.Timestamp], freqs: list[float], psds: li
     ax.set_ylabel("Band level (dB, uncalibrated)")
     ax.grid(True, alpha=0.3)
     plt.show()
+
+def acoustic_events(times: list[pd.Timestamp], band_level:float, baseline_hours=6, thresh_db=6.0, min_minutes=3)-> tuple[pd.DataFrame, np.ndarray[float],np.ndarray[float] ]:
+    s = pd.Series(band_level, index=pd.DatetimeIndex(times))
+    win = f"{int(baseline_hours * 60)}min"
+    base = s.rolling(win, center=True, min_periods=5).median()
+    excess = s - base
+    above = (excess >= thresh_db).values
+    ev, i, n = [], 0, len(s)
+    while i < n:
+        if above[i]:
+            j = i
+            while j + 1 < n and above[j + 1] and (s.index[j + 1] - s.index[j]) <= pd.Timedelta(minutes=5):
+                j += 1
+            if (s.index[j] - s.index[i]) >= pd.Timedelta(minutes=min_minutes - 1):
+                seg = excess.iloc[i:j + 1]
+                k = seg.values.argmax()
+                ev.append(dict(start=s.index[i], end=s.index[j], peak_time=seg.index[k],
+                               peak_level=s.iloc[i + k], peak_excess=seg.iloc[k]))
+            i = j + 1
+        else:
+            i += 1
+    return pd.DataFrame(ev), base.values, excess.values

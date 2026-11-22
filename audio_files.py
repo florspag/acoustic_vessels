@@ -30,7 +30,7 @@ class HarpMetadata:
 
 
 @dataclass
-class AUDIO_DATA:
+class AudioData:
     nb_channels: int
     sample_rate: int
     block_align: int = None
@@ -48,13 +48,40 @@ class AudioFile:
 
     def __init__(self, filename: str, store: GCStore):
         self.filename: str = filename
+        self.name: str = os.path.basename(filename)
         self.store: GCStore = store
+        logger.debug("%s: opening GCS stream", self.name)
         self.reader: BlobReader = store.open_file(filename=filename)
         self.kind: AudioExtenstion = GCStore.audio_file_extention(filename)
         self.timestamp: pd.Timestamp | None = GCStore.time_from_name(filename)
+        if self.timestamp is None:
+            logger.warning("%s: no timestamp in file name, segments start at epoch", self.name)
         self.harp = None
         self.harp_meta: Optional[HarpMetadata] = None
-        self.audio_data = self.parse()
+        try:
+            self.audio_data = self.parse()
+        except Exception:
+            logger.exception("%s: header parsing failed", self.name)
+            self.reader.close()
+            raise
+        self._log_summary()
+
+    def _log_summary(self) -> None:
+        ad = self.audio_data
+        frames = sum(s.n_frames for s in ad.segments)
+        logger.info(
+            "%s: %s, %d Hz, %d ch%s, %d segment(s), %.1f min of audio, starts %s%s",
+            self.name,
+            self.kind.value,
+            ad.sample_rate,
+            ad.nb_channels,
+            f", {ad.bits}-bit{' float' if ad.float_fmt else ''}" if ad.bits else "",
+            len(ad.segments),
+            frames / ad.sample_rate / 60,
+            ad.segments[0].start if ad.segments else None,
+            f", HARP site={self.harp_meta.site} depth={self.harp_meta.depth} m"
+            if self.harp_meta else "",
+        )
 
     # -- open / close
     @property
@@ -65,12 +92,15 @@ class AudioFile:
         """Reopen the GCS stream if it was closed. Parsed metadata is kept,
         so only the stream (and the SoundFile wrapper for non-WAV) is rebuilt."""
         if self.closed:
+            logger.debug("%s: reopening GCS stream", self.name)
             self.reader = self.store.open_file(filename=self.filename)
             if self.kind != AudioExtenstion.WAVE:
                 self.audio_data.sound_file = sf.SoundFile(self.reader)
         return self
 
     def close(self) -> None:
+        if not self.closed:
+            logger.debug("%s: closing GCS stream", self.name)
         if self.audio_data.sound_file is not None and not self.audio_data.sound_file.closed:
             self.audio_data.sound_file.close()
         if self.reader is not None and not self.reader.closed:
@@ -82,16 +112,16 @@ class AudioFile:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def parse(self) -> AUDIO_DATA:
+    def parse(self) -> AudioData:
         match self.kind:
             case AudioExtenstion.WAVE:
                 return self._parse_wav()
             case _:
                 return self._parse_sf()
 
-    def _parse_sf(self) -> AUDIO_DATA:
+    def _parse_sf(self) -> AudioData:
         _sf = sf.SoundFile(self.reader)
-        audio_data = AUDIO_DATA(
+        audio_data = AudioData(
             nb_channels=_sf.channels, sample_rate=_sf.samplerate, sound_file=_sf
         )
         audio_data.scale = {
@@ -104,7 +134,7 @@ class AudioFile:
         return audio_data
 
     # -- RIFF parsing
-    def _parse_wav(self) -> AUDIO_DATA:
+    def _parse_wav(self) -> AudioData:
         data = self.reader
         head = data.read(12)
         if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
@@ -127,6 +157,7 @@ class AudioFile:
             if len(hdr) < 8:
                 break
             cid, csize = hdr[:4], struct.unpack("<I", hdr[4:])[0]
+            logger.debug("%s: RIFF chunk %r at %d, %d bytes", self.name, cid, pos, csize)
             if cid == b"fmt ":
                 fmt = data.read(csize)
             elif cid == b"harp":
@@ -136,13 +167,18 @@ class AudioFile:
                 data_len = csize
                 if file_size and (csize == 0xFFFFFFFF or data_loc + csize > file_size):
                     data_len = file_size - data_loc
+                    logger.warning(
+                        "%s: data chunk size %d exceeds file, truncated to %d bytes",
+                        self.name, csize, data_len,
+                    )
                 break
             pos += 8 + csize + (csize & 1)
         if fmt is None or data_loc is None:
+            logger.error("%s: fmt=%s data=%s", self.name, fmt is not None, data_loc is not None)
             raise ValueError(f"{self.filename}: missing fmt or data chunk")
 
         tag, nch, fs, _, block_align, bits = struct.unpack("<HHIIHH", fmt[:16])
-        audio_data = AUDIO_DATA(
+        audio_data = AudioData(
             nb_channels=nch, sample_rate=fs, block_align=block_align, bits=bits
         )
         if tag == 0xFFFE and len(fmt) >= 26:
@@ -185,11 +221,15 @@ class AudioFile:
                 if not (data_loc <= byte_loc <= data_loc + data_len) or sr <= 0:
                     raise ValueError("raw-file entry outside data chunk")
                 segs.append(Segment(t, byte_loc, byte_len // block_align))
+            logger.debug(
+                "%s: HARP %s/%s lat=%.5f lon=%.5f, %d raw file(s)",
+                self.name, self.harp_meta.experiment, self.harp_meta.site,
+                self.harp_meta.latitude, self.harp_meta.longitude, n_raw,
+            )
             return segs
         except Exception as e:  # malformed -> fall back to filename time
-            raise ValueError(
-                f"  ! {os.path.basename(self.filename)}: harp chunk not usable ({e}); using filename time"
-            )
+            logger.warning("%s: harp chunk not usable (%s); using filename time", self.name, e)
+            return None
 
     def read(self, seg: Segment, frame_off: int, n: int) -> np.ndarray:
         """Return first channel as float64 in ADC counts (int formats)."""
@@ -197,6 +237,7 @@ class AudioFile:
         if n == 0:
             return np.zeros(0)
         self.open()  # no-op if already open
+        logger.debug("%s: read %d frames at offset %d of segment %s", self.name, n, frame_off, seg.start)
         if self.kind != AudioExtenstion.WAVE:
             self.audio_data.sound_file.seek(seg.byte_loc + frame_off)
             dtype = "float64"
@@ -206,8 +247,11 @@ class AudioFile:
             )
             return x
         self.reader.seek(seg.byte_loc + frame_off * self.audio_data.block_align)
+        want = n
         raw = self.reader.read(n * self.audio_data.block_align)
         n = len(raw) // self.audio_data.block_align
+        if n < want:
+            logger.warning("%s: short read, got %d of %d frames", self.name, n, want)
         raw = raw[: n * self.audio_data.block_align]
         if self.audio_data.bytes_per == 2:
             x = np.frombuffer(raw, "<i2")
