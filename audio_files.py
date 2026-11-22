@@ -370,8 +370,7 @@ def load_calibration(tf_path, freqs, gain_db):
         cal += np.interp(freqs, tf[:, 0], tf[:, 1])
     return cal
 
-
-def extract_spectral(
+def extract_spectral_distribution(
     audio_file: AudioFile,
     t0: pd.Timestamp,
     t1: pd.Timestamp,
@@ -434,13 +433,16 @@ def extract_spectral(
                             n_used += 1
             k += 1
     logger.info(
-        f" {os.path.basename(audio_file.filename)}  fs={audio_file.audio_data.sample_rate}  "
-        f"{len(audio_file.audio_data.segments)} segment(s)  {n_used} minutes"
+        " %s  fs=%s  %d segment(s)  %d minutes",
+        os.path.basename(audio_file.filename),
+        audio_file.audio_data.sample_rate,
+        len(audio_file.audio_data.segments),
+        n_used,
     )
     return times, freqs, rows
 
 
-def process_audio(
+def extract_spectrum_multiple_files(
     audio_files: list[AudioFile],
     t0,
     t1,
@@ -453,7 +455,7 @@ def process_audio(
     rows:list[np.ndarray[float]] = []
     freqs = None
     for i, p in enumerate(audio_files):
-        tms, frqs, rws = extract_spectral(
+        tms, frqs, rws = extract_spectral_distribution(
             audio_file=p,
             t0=t0,
             t1=t1,
@@ -463,7 +465,7 @@ def process_audio(
             gain_db=gain_db,
         )
         p.close()  # free the GCS stream; read() reopens it if needed later
-        logger.info(f"  [{i + 1}/{len(audio_files)}]")
+        logger.info("  [%d/%d]", i + 1, len(audio_files))
         times += tms
         rows += rws
         if freqs is None:
@@ -480,11 +482,45 @@ def process_audio(
     return t, freqs.astype(np.float32), psd, calibrated
 
 
+def band_levels(freqs, psd_db, bands)->dict[str, float]:
+    p = 10 ** (psd_db.astype(np.float64) / 10)
+    df = np.gradient(freqs)
+    out = {}
+    for name, (lo, hi) in bands.items():
+        m = (freqs >= lo) & (freqs < hi)
+        out[name] = 10 * np.log10((p[..., m] * df[m]).sum(axis=-1) + 1e-20) if m.any() else np.nan
+    return out
+
+
+def standard_bands(fmax) -> dict[str, tuple[float, float]]:
+    b = {"broadband_20_500Hz": (20, min(500, fmax))}
+    for fc in (63, 125, 250, 500):           # MSFD ship-noise third-octave bands
+        if fc * 2 ** (1 / 6) <= fmax:
+            b[f"tol_{fc}Hz"] = (fc * 2 ** (-1 / 6), fc * 2 ** (1 / 6))
+    return b
+
+
 def plot_spectral(freqs: list[float], psd: np.array, calibrated:bool):
-    fig, ax = plt.subplots(figsize=(9, 4))
+    _, ax = plt.subplots(figsize=(9, 4))
     ax.semilogx(freqs, psd)
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("PSD (dB re 1 µPa²/Hz)" if calibrated else "PSD (dB, uncalibrated)")
     ax.set_title("Spectrum")
+    ax.grid(True, which="both", alpha=0.3)
+    plt.show()
+
+
+def plot_bands(freqs: list[float], psd: np.array, bands_def: dict, bands_levels: dict):
+    _, ax = plt.subplots(figsize=(9, 4))
+    ax.semilogx(freqs, psd, color="0.3", lw=1, label="PSD")
+    for i, (name, (lo, hi)) in enumerate(bands_def.items()):
+        if name.startswith("broadband"):
+            continue  # it would hide the third-octave bands
+        c = f"C{i}"
+        ax.axvspan(lo, hi, color=c, alpha=0.2)
+        ax.text(np.sqrt(lo * hi), ax.get_ylim()[1], f"{name}\n{bands_levels[name]:.1f} dB",
+                ha="center", va="top", fontsize=8, color=c)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD (dB, uncalibrated)")
     ax.grid(True, which="both", alpha=0.3)
     plt.show()
