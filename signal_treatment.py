@@ -1,5 +1,7 @@
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import numpy as np
 import pandas as pd
@@ -8,6 +10,7 @@ import matplotlib.pyplot as plt
 from scipy import signal
 
 from audio_files import AudioFile, logger
+from gc_files import GCStore
 
 def _decimator(fs_in: int, fs_out: int):
     if fs_in <= fs_out:
@@ -105,59 +108,91 @@ def extract_spectrum_multiple_files(
     fmax: float = 1000.0,
     tf=None,
     gain_db: float = 0.0,
+    workers: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     """Spectra of several files over [t0, t1], merged and sorted by time.
 
     `audio_files` may hold AudioFile objects or bucket paths; paths are opened
-    one at a time with `store` (a GCStore) and closed right after, so only one
-    GCS stream is open at once. Files with no audio in the window are skipped.
+    with `store` (a GCStore) and closed as soon as the file is processed.
+    With `workers > 1`, files are processed in parallel threads (at most
+    `workers` GCS streams open at once); each thread gets its own GCS client.
+    Files with no audio in the window are skipped.
     Returns (times as datetime64[ns], freqs, psd of shape (n_times, n_freqs), calibrated).
     """
-    times: list[pd.Timestamp] = []
-    rows: list[np.ndarray] = []
-    freqs = None
     n = len(audio_files)
-    skipped: list[str] = []
+    if store is None and any(isinstance(p, str) for p in audio_files):
+        raise ValueError("pass `store` when audio_files contains paths")
+    workers = max(1, min(workers, n))
     t_start = time.perf_counter()
     logger.info(
-        "Extracting spectra from %d file(s) between %s and %s (%.0f s/min, fmax=%.0f Hz)",
-        n, t0, t1, seconds_per_minute, fmax,
+        "Extracting spectra from %d file(s) between %s and %s (%.0f s/min, fmax=%.0f Hz, %d worker(s))",
+        n, t0, t1, seconds_per_minute, fmax, workers,
     )
-    for i, p in enumerate(audio_files):
+
+    local = threading.local()
+
+    def thread_store():
+        # google-cloud-storage clients are not guaranteed thread-safe: one per thread
+        if workers == 1:
+            return store
+        if not hasattr(local, "store"):
+            local.store = GCStore(bucket=store.bucket.name)
+        return local.store
+
+    def process(i: int, p: AudioFile | str):
         name = os.path.basename(p if isinstance(p, str) else p.filename)
         t_file = time.perf_counter()
         logger.debug("[%d/%d] opening %s", i + 1, n, name)
-        if isinstance(p, str):
-            if store is None:
-                raise ValueError("pass `store` when audio_files contains paths")
-            p = AudioFile(filename=p, store=store)
         try:
-            tms, frqs, rws = extract_spectral_distribution(
-                audio_file=p,
-                t0=t0,
-                t1=t1,
-                seconds_per_minute=seconds_per_minute,
-                fmax=fmax,
-            )
+            if isinstance(p, str):
+                p = AudioFile(filename=p, store=thread_store())
+            try:
+                tms, frqs, rws = extract_spectral_distribution(
+                    audio_file=p,
+                    t0=t0,
+                    t1=t1,
+                    seconds_per_minute=seconds_per_minute,
+                    fmax=fmax,
+                )
+            finally:
+                p.close()  # free the GCS stream; read() reopens it if needed later
         except Exception:
             logger.exception("[%d/%d] %s: extraction failed", i + 1, n, name)
             raise
-        finally:
-            p.close()  # free the GCS stream; read() reopens it if needed later
         elapsed = time.perf_counter() - t_file
         if not rws:
-            skipped.append(name)
             logger.warning("[%d/%d] %s: no audio in window, skipped (%.1f s)", i + 1, n, name, elapsed)
+        else:
+            logger.info(
+                "[%d/%d] %s: %d minute(s), %s -> %s (%.1f s)",
+                i + 1, n, name, len(rws), tms[0], tms[-1], elapsed,
+            )
+        return name, tms, frqs, rws
+
+    if workers == 1:
+        results = [process(i, p) for i, p in enumerate(audio_files)]
+    else:
+        ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="spectrum")
+        try:
+            results = list(ex.map(process, range(n), audio_files))  # keeps input order
+        except BaseException:
+            ex.shutdown(wait=True, cancel_futures=True)  # don't start remaining files
+            raise
+        ex.shutdown(wait=True)
+
+    times: list[pd.Timestamp] = []
+    rows: list[np.ndarray] = []
+    freqs = None
+    skipped: list[str] = []
+    for name, tms, frqs, rws in results:
+        if not rws:
+            skipped.append(name)
             continue
-        logger.info(
-            "[%d/%d] %s: %d minute(s), %s -> %s (%.1f s)",
-            i + 1, n, name, len(rws), tms[0], tms[-1], elapsed,
-        )
         if freqs is None:
             freqs = frqs
         elif len(frqs) != len(freqs) or not np.allclose(frqs, freqs):
             raise ValueError(
-                f"{p.filename}: frequency grid differs from previous files "
+                f"{name}: frequency grid differs from previous files "
                 f"({len(frqs)} vs {len(freqs)} bins); sample rate below 2*fmax?"
             )
         times += tms

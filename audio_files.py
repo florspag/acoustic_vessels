@@ -41,6 +41,10 @@ class AudioData:
     segments: list[Segment] = None
     sound_file: Optional[sf.SoundFile] = None
 
+@dataclass
+class TimePeriod:
+    start: pd.Timestamp
+    end: pd.Timestamp
 
 class AudioFile:
     """Random-access reader. For WAV/XWAV reads PCM bytes directly so that
@@ -267,3 +271,11 @@ class AudioFile:
         else:
             raise ValueError(f"unsupported bit depth {self.audio_data.bits}")
         return x.reshape(-1, self.audio_data.nb_channels)[:, 0].astype(np.float64)
+
+
+    def time_range(self)->TimePeriod:
+        fs = self.audio_data.sample_rate
+        segs = self.audio_data.segments
+        start = min(s.start for s in segs)
+        end = max(s.start + pd.Timedelta(seconds=s.n_frames / fs) for s in segs)
+        return TimePeriod(start=start, end=end)

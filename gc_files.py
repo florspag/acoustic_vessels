@@ -92,21 +92,24 @@ class GCStore:
         extentions: Optional[list[AudioExtenstion]] = None,
         start_date: Optional[pd.Timestamp] = None,
         end_date: Optional[pd.Timestamp] = None,
-    ):
-        if not extentions:
-            return filenames
+    ) -> list[str]:
+        """Keep files matching the extensions and date window, sorted by the
+        date in their name (files with no date in their name go last)."""
         files_kept = []
         for filename in filenames:
             file_date = GCStore.time_from_name(filename)
             ext = filename.split(".")[-1]
             if extentions and ext not in extentions:
                 continue
+            if file_date is None and (start_date is not None or end_date is not None):
+                continue  # can't place it in the window
             if start_date is not None and file_date < start_date:
                 continue
             if end_date is not None and file_date > end_date:
                 continue
-            files_kept.append(filename)
-        return files_kept
+            files_kept.append((file_date, filename))
+        files_kept.sort(key=lambda df: (df[0] is None, df[0] or pd.Timestamp.min, df[1]))
+        return [f for _, f in files_kept]
 
     @staticmethod
     def audio_file_extention(filename: str) -> AudioExtenstion:
