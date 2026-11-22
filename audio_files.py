@@ -1,3 +1,8 @@
+"""Random-access reading of audio files streamed from Google Cloud Storage.
+
+Supports WAV, Triton HARP XWAV (duty-cycled segments and site metadata) and
+any format ``soundfile`` can read (FLAC, AIFF, ...).
+"""
 import os
 import struct
 import logging
@@ -14,6 +19,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Segment:
+    """A continuous block of samples inside an audio file.
+
+    Plain files have one segment; duty-cycled HARP XWAV files have one per
+    recording block.
+
+    Attributes
+    ----------
+    start : pandas.Timestamp
+        Time of the first sample.
+    byte_loc : int
+        WAV: absolute byte offset of the first sample in the file.
+        Other formats: frame offset of the first sample (0).
+    n_frames : int
+        Number of frames (samples per channel) in the segment.
+    """
     start: pd.Timestamp  # time of first sample
     byte_loc: int  # absolute byte offset of first sample (WAV only)
     n_frames: int
@@ -21,34 +41,116 @@ class Segment:
 
 @dataclass
 class HarpMetadata:
+    """Deployment metadata from a Triton XWAV ``harp`` chunk.
+
+    Attributes
+    ----------
+    site : str
+        Site code, e.g. ``"EF"``.
+    experiment : str
+        Project / experiment name.
+    longitude, latitude : float
+        Position in decimal degrees.
+    depth : float
+        Instrument depth in metres.
+    n_raw : int
+        Number of raw files (segments) in the XWAV.
+    """
     site: str
     experiment: str
     longitude: float
     latitude: float
     depth: float
-    n_raw: bytearray
+    n_raw: int
 
 
 @dataclass
 class AudioData:
+    """Format information and segments of an :class:`AudioFile`.
+
+    Attributes
+    ----------
+    nb_channels : int
+        Number of channels.
+    sample_rate : int
+        Sample rate in Hz.
+    block_align : int, optional
+        WAV only: bytes per frame (all channels).
+    bits : int, optional
+        WAV only: bits per sample.
+    scale : float, optional
+        Non-WAV only: factor turning ``soundfile``'s [-1, 1] floats back into
+        ADC counts (``2**15`` for 16-bit, ...; 1.0 for float formats).
+    float_fmt : bool, optional
+        WAV only: ``True`` for IEEE-float samples.
+    bytes_per : int, optional
+        WAV only: bytes per sample.
+    segments : list[Segment]
+        Continuous blocks of samples, in file order.
+    sound_file : soundfile.SoundFile, optional
+        Non-WAV only: the open ``soundfile`` reader.
+    """
     nb_channels: int
     sample_rate: int
-    block_align: int = None
-    bits: int = None
-    scale: dict = None
-    float_fmt: int = None
-    bytes_per: bytearray = None
-    segments: list[Segment] = None
+    block_align: Optional[int] = None
+    bits: Optional[int] = None
+    scale: Optional[float] = None
+    float_fmt: Optional[bool] = None
+    bytes_per: Optional[int] = None
+    segments: Optional[list[Segment]] = None
     sound_file: Optional[sf.SoundFile] = None
 
 @dataclass
 class TimePeriod:
+    """A time interval, from ``start`` to ``end``."""
     start: pd.Timestamp
     end: pd.Timestamp
 
 class AudioFile:
-    """Random-access reader. For WAV/XWAV reads PCM bytes directly so that
-    duty-cycled or sub-sampled reads only fetch the bytes needed from GCS."""
+    """Random-access reader for an audio file streamed from GCS.
+
+    WAV/XWAV headers are parsed by hand and PCM bytes are read directly, so a
+    duty-cycled or sub-sampled read fetches only the bytes it needs. Triton
+    XWAV ``harp`` chunks are decoded into timed segments and site metadata.
+    Other formats (FLAC, AIFF, ...) are read through ``soundfile``.
+
+    The header is parsed on construction, which opens a GCS stream. Use
+    :meth:`close` (or a ``with`` block) to release it; :meth:`read` reopens it
+    when needed.
+
+    Parameters
+    ----------
+    filename : str
+        Full blob name in the store's bucket.
+    store : GCStore
+        Store the file is read from.
+
+    Attributes
+    ----------
+    filename : str
+        Full blob name.
+    name : str
+        Base name of the file, used in log messages.
+    kind : AudioExtenstion
+        File type, from the extension.
+    timestamp : pandas.Timestamp or None
+        Start time parsed from the file name.
+    audio_data : AudioData
+        Parsed format and segments.
+    harp_meta : HarpMetadata or None
+        HARP deployment metadata, for XWAV files with a valid ``harp`` chunk.
+
+    Raises
+    ------
+    ValueError
+        If the extension is unknown or the WAV header is invalid.
+
+    Examples
+    --------
+    >>> with AudioFile("sefsc/.../GOM_EF_01_160731_115002.x.flac", store) as af:
+    ...     seg = af.audio_data.segments[0]
+    ...     x = af.read(seg, frame_off=0, n=10 * af.audio_data.sample_rate)
+    """
 
     def __init__(self, filename: str, store: GCStore):
         self.filename: str = filename
@@ -90,11 +192,20 @@ class AudioFile:
     # -- open / close
     @property
     def closed(self) -> bool:
+        """``True`` if the GCS stream is not open."""
         return self.reader is None or self.reader.closed
 
     def open(self) -> "AudioFile":
-        """Reopen the GCS stream if it was closed. Parsed metadata is kept,
-        so only the stream (and the SoundFile wrapper for non-WAV) is rebuilt."""
+        """Reopen the GCS stream if it was closed.
+
+        Parsed metadata is kept, so only the stream (and the ``SoundFile``
+        wrapper for non-WAV files) is rebuilt.
+
+        Returns
+        -------
+        AudioFile
+            ``self``, so it can be chained.
+        """
         if self.closed:
             logger.debug("%s: reopening GCS stream", self.name)
             self.reader = self.store.open_file(filename=self.filename)
@@ -103,6 +214,10 @@ class AudioFile:
         return self
 
     def close(self) -> None:
+        """Close the GCS stream and the ``soundfile`` reader, if open.
+
+        Safe to call several times. Parsed metadata stays available.
+        """
         if not self.closed:
             logger.debug("%s: closing GCS stream", self.name)
         if self.audio_data.sound_file is not None and not self.audio_data.sound_file.closed:
@@ -117,6 +232,11 @@ class AudioFile:
         self.close()
 
     def parse(self) -> AudioData:
+        """Parse the file header and return its :class:`AudioData`.
+
+        Called on construction; uses the WAV/XWAV parser for ``.wav`` files
+        and ``soundfile`` for everything else.
+        """
         match self.kind:
             case AudioExtenstion.WAVE:
                 return self._parse_wav()
@@ -139,6 +259,7 @@ class AudioFile:
 
     # -- RIFF parsing
     def _parse_wav(self) -> AudioData:
+        """Parse RIFF/WAVE chunks (``fmt``, ``harp``, ``data``) by hand."""
         data = self.reader
         head = data.read(12)
         if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
@@ -201,7 +322,18 @@ class AudioFile:
         return audio_data
 
     def _parse_harp(self, data_loc, data_len, block_align):
-        """Triton XWAV 'harp' subchunk: 56-byte header + 32 bytes per raw file."""
+        """Decode a Triton XWAV ``harp`` chunk into timed segments.
+
+        The chunk is a 56-byte header followed by one 32-byte entry per raw
+        file. Each entry gives the start time (to the millisecond) and byte
+        range of a recording block. Also sets :attr:`harp_meta`.
+
+        Returns
+        -------
+        list[Segment] or None
+            One segment per raw file, or ``None`` if the chunk is malformed
+            (a warning is logged and the caller falls back to the file-name time).
+        """
         h = self.harp
         try:
             n_raw = struct.unpack("<H", h[36:38])[0]
@@ -236,7 +368,29 @@ class AudioFile:
             return None
 
     def read(self, seg: Segment, frame_off: int, n: int) -> np.ndarray:
-        """Return first channel as float64 in ADC counts (int formats)."""
+        """Read samples from one segment.
+
+        Parameters
+        ----------
+        seg : Segment
+            Segment to read from, one of ``audio_data.segments``.
+        frame_off : int
+            Offset in frames from the start of the segment.
+        n : int
+            Number of frames to read; clipped to the end of the segment.
+
+        Returns
+        -------
+        numpy.ndarray
+            First channel only, as float64. Integer formats are in ADC counts
+            (not normalised to [-1, 1]); float formats are returned as stored.
+            Empty if nothing is left to read.
+
+        Raises
+        ------
+        ValueError
+            For WAV bit depths other than 16, 24 or 32.
+        """
         n = max(0, min(n, seg.n_frames - frame_off))
         if n == 0:
             return np.zeros(0)
@@ -274,6 +428,16 @@ class AudioFile:
 
 
     def time_range(self)->TimePeriod:
+        """Return when the audio starts and ends.
+
+        Covers all segments: ``start`` is the first sample of the earliest
+        segment, ``end`` the last sample of the latest one. Gaps between
+        duty-cycled segments are not reported.
+
+        Returns
+        -------
+        TimePeriod
+        """
         fs = self.audio_data.sample_rate
         segs = self.audio_data.segments
         start = min(s.start for s in segs)

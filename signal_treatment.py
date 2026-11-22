@@ -1,3 +1,8 @@
+"""Spectral analysis of underwater recordings for ship-noise monitoring.
+
+Per-minute Welch power spectral densities, calibration, integration over the
+ship-noise frequency bands, plots, and detection of loud events.
+"""
 import os
 import time
 import threading
@@ -13,6 +18,11 @@ from audio_files import AudioFile, logger
 from gc_files import GCStore
 
 def _decimator(fs_in: int, fs_out: int):
+    """Build a resampler from ``fs_in`` down to about ``fs_out`` Hz.
+
+    Returns ``(fs_eff, fn)``: the exact output rate and a function applying a
+    polyphase resample. If ``fs_in <= fs_out`` the signal is left unchanged.
+    """
     if fs_in <= fs_out:
         return fs_in, (lambda x: x)
     r = Fraction(fs_out, fs_in).limit_denominator(2000)
@@ -21,6 +31,24 @@ def _decimator(fs_in: int, fs_out: int):
 
 
 def load_calibration(tf_path, freqs, gain_db):
+    """Build the dB correction to add to a PSD.
+
+    Parameters
+    ----------
+    tf_path : str or None
+        Text file with two columns: frequency (Hz) and correction (dB).
+        Lines starting with ``#`` or ``%`` are ignored. Interpolated onto
+        ``freqs``.
+    freqs : numpy.ndarray
+        Frequencies of the PSD bins, in Hz.
+    gain_db : float
+        Constant offset added at all frequencies.
+
+    Returns
+    -------
+    numpy.ndarray
+        Correction in dB, same shape as ``freqs``.
+    """
     cal = np.full(freqs.shape, float(gain_db or 0.0))
     if tf_path:
         tf = np.loadtxt(tf_path, comments=("#", "%"), delimiter=None, usecols=(0, 1))
@@ -36,6 +64,39 @@ def extract_spectral_distribution(
     tf=None,
     gain_db: float = 0.0,
 ) -> tuple[list[pd.Timestamp], np.ndarray, list[np.ndarray]]:
+    """Compute one power spectral density per minute of a single file.
+
+    At each minute in ``[t0, t1]`` (counted from the start of each segment),
+    the first ``seconds_per_minute`` seconds are read, the DC offset is
+    removed, the signal is decimated to ``2 * fmax`` and a Welch PSD is
+    computed (1 s Hann window, 50 % overlap, so 1 Hz bins). Readings shorter
+    than 2 s are skipped.
+
+    Parameters
+    ----------
+    audio_file : AudioFile
+        File to analyse.
+    t0, t1 : pandas.Timestamp
+        Time window.
+    seconds_per_minute : float, default 10.0
+        Seconds of audio analysed at the start of each minute.
+    fmax : float, default 1000.0
+        Highest frequency kept, in Hz.
+    tf : str, optional
+        Calibration file, see :func:`load_calibration`.
+    gain_db : float, default 0.0
+        Constant calibration offset, in dB.
+
+    Returns
+    -------
+    times : list[pandas.Timestamp]
+        Start time of each analysed minute.
+    freqs : numpy.ndarray or None
+        Bin frequencies from 1 Hz to ``fmax``; ``None`` if nothing was analysed.
+    rows : list[numpy.ndarray]
+        One PSD per minute, in dB, aligned with ``freqs``. Calibrated
+        (dB re 1 µPa²/Hz) if ``tf`` or ``gain_db`` is given, else relative.
+    """
 
     # Setup decimation
     fs_target = int(2 * fmax)
@@ -96,6 +157,9 @@ def extract_spectral_distribution(
         len(audio_file.audio_data.segments),
         n_used,
     )
+    if rows and (tf or gain_db):
+        cal = load_calibration(tf, freqs, gain_db)
+        rows = [r + cal for r in rows]
     return times, freqs, rows
 
 
@@ -110,14 +174,50 @@ def extract_spectrum_multiple_files(
     gain_db: float = 0.0,
     workers: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Spectra of several files over [t0, t1], merged and sorted by time.
+    """Compute per-minute spectra over several files, merged and sorted by time.
 
-    `audio_files` may hold AudioFile objects or bucket paths; paths are opened
-    with `store` (a GCStore) and closed as soon as the file is processed.
-    With `workers > 1`, files are processed in parallel threads (at most
-    `workers` GCS streams open at once); each thread gets its own GCS client.
-    Files with no audio in the window are skipped.
-    Returns (times as datetime64[ns], freqs, psd of shape (n_times, n_freqs), calibrated).
+    Runs :func:`extract_spectral_distribution` on each file, checks that all
+    files give the same frequency grid, then applies calibration.
+
+    Parameters
+    ----------
+    audio_files : list[AudioFile or str]
+        Files to analyse, as ``AudioFile`` objects or blob names. Blob names
+        are opened with ``store`` and closed as soon as the file is done;
+        prefer them, so streams are not held open in advance.
+    t0, t1 : pandas.Timestamp
+        Time window.
+    store : GCStore, optional
+        Required when ``audio_files`` contains blob names.
+    seconds_per_minute : float, default 10.0
+        Seconds of audio analysed at the start of each minute.
+    fmax : float, default 1000.0
+        Highest frequency kept, in Hz.
+    tf : str, optional
+        Calibration file, see :func:`load_calibration`.
+    gain_db : float, default 0.0
+        Constant calibration offset, in dB.
+    workers : int, default 1
+        Number of files processed in parallel threads. At most ``workers``
+        GCS streams are open at once, and each thread gets its own GCS client.
+
+    Returns
+    -------
+    times : numpy.ndarray of datetime64[ns]
+        Start time of each analysed minute, sorted.
+    freqs : numpy.ndarray of float32
+        Bin frequencies, in Hz.
+    psd : numpy.ndarray of float32
+        PSD in dB, shape ``(n_times, n_freqs)``.
+    calibrated : bool
+        ``True`` if ``tf`` or ``gain_db`` was applied.
+
+    Raises
+    ------
+    ValueError
+        If blob names are given without ``store``, if files give different
+        frequency grids (sample rate below ``2 * fmax``), or if no file has
+        audio in the window.
     """
     n = len(audio_files)
     if store is None and any(isinstance(p, str) for p in audio_files):
@@ -218,6 +318,27 @@ def extract_spectrum_multiple_files(
 
 
 def band_levels(freqs, psd_db, bands)->dict[str, float]:
+    """Integrate a PSD over frequency bands.
+
+    Power is summed over each band in linear units, weighted by bin width,
+    then converted back to dB.
+
+    Parameters
+    ----------
+    freqs : numpy.ndarray
+        Bin frequencies, in Hz.
+    psd_db : numpy.ndarray
+        PSD in dB, shape ``(n_freqs,)`` or ``(n_times, n_freqs)``.
+    bands : dict[str, tuple[float, float]]
+        Band name -> ``(low, high)`` in Hz; ``low`` is included, ``high``
+        excluded. See :func:`standard_bands`.
+
+    Returns
+    -------
+    dict[str, float or numpy.ndarray]
+        Band level in dB per band: a float for a single spectrum, an array of
+        shape ``(n_times,)`` for a 2D input. ``nan`` if no bin is in the band.
+    """
     p = 10 ** (psd_db.astype(np.float64) / 10)
     df = np.gradient(freqs)
     out = {}
@@ -228,6 +349,22 @@ def band_levels(freqs, psd_db, bands)->dict[str, float]:
 
 
 def standard_bands(fmax) -> dict[str, tuple[float, float]]:
+    """Frequency bands used to monitor ship noise.
+
+    Returns a broadband 20–500 Hz band plus the third-octave bands centred on
+    63, 125, 250 and 500 Hz (EU MSFD ship-noise indicators). Bands above
+    ``fmax`` are left out and the broadband band is capped at ``fmax``.
+
+    Parameters
+    ----------
+    fmax : float
+        Highest frequency available, in Hz (usually ``freqs[-1]``).
+
+    Returns
+    -------
+    dict[str, tuple[float, float]]
+        Band name -> ``(low, high)`` in Hz, e.g. ``"tol_63Hz"``.
+    """
     b = {"broadband_20_500Hz": (20, min(500, fmax))}
     for fc in (63, 125, 250, 500):           # MSFD ship-noise third-octave bands
         if fc * 2 ** (1 / 6) <= fmax:
@@ -236,6 +373,17 @@ def standard_bands(fmax) -> dict[str, tuple[float, float]]:
 
 
 def plot_spectral(freqs: list[float], psd: np.array, calibrated:bool):
+    """Plot one spectrum on a logarithmic frequency axis.
+
+    Parameters
+    ----------
+    freqs : array-like
+        Bin frequencies, in Hz.
+    psd : numpy.ndarray
+        PSD in dB, same length as ``freqs``.
+    calibrated : bool
+        Label the y-axis in dB re 1 µPa²/Hz if ``True``, else as uncalibrated.
+    """
     _, ax = plt.subplots(figsize=(9, 4))
     ax.semilogx(freqs, psd)
     ax.set_xlabel("Frequency (Hz)")
@@ -246,6 +394,22 @@ def plot_spectral(freqs: list[float], psd: np.array, calibrated:bool):
 
 
 def plot_bands_spectrum(freqs: list[float], psd: np.array, bands_def: dict, bands_levels: dict):
+    """Plot one spectrum with the third-octave bands shaded and labelled.
+
+    The broadband band is not drawn, as it would cover the others.
+
+    Parameters
+    ----------
+    freqs : array-like
+        Bin frequencies, in Hz.
+    psd : numpy.ndarray
+        PSD in dB, same length as ``freqs``.
+    bands_def : dict[str, tuple[float, float]]
+        Bands to draw, from :func:`standard_bands`.
+    bands_levels : dict[str, float]
+        Level of each band for this spectrum, from :func:`band_levels`;
+        shown in each band's label.
+    """
     _, ax = plt.subplots(figsize=(9, 4))
     ax.semilogx(freqs, psd, color="0.3", lw=1, label="PSD")
     for i, (name, (lo, hi)) in enumerate(bands_def.items()):
@@ -262,6 +426,26 @@ def plot_bands_spectrum(freqs: list[float], psd: np.array, bands_def: dict, band
 
 
 def plot_bands_timeserie(times: list[pd.Timestamp], freqs: list[float], psds: list[np.array], bands_def: dict, instant: Optional[int]=None):
+    """Plot the level of each band over time.
+
+    Parameters
+    ----------
+    times : array-like of pandas.Timestamp
+        Time of each spectrum.
+    freqs : array-like
+        Bin frequencies, in Hz.
+    psds : list[numpy.ndarray] or numpy.ndarray
+        Spectra in dB, one per time, or a ``(n_times, n_freqs)`` array.
+    bands_def : dict[str, tuple[float, float]]
+        Bands to plot, from :func:`standard_bands`.
+    instant : int, optional
+        Index of a time to mark with a dashed vertical line.
+
+    Raises
+    ------
+    ValueError
+        If ``instant`` is past the end of ``times``.
+    """
     P = np.vstack(psds)                      # (n_times, n_freqs)
     bt = band_levels(freqs=freqs, psd_db=P, bands=bands_def)   # each value is an array of shape (n_times,)
 
@@ -269,7 +453,7 @@ def plot_bands_timeserie(times: list[pd.Timestamp], freqs: list[float], psds: li
 
     ax = df_bands.plot(figsize=(10, 4), lw=1)
     if instant is not None:
-        if instant > len(times):
+        if not -len(times) <= instant < len(times):
             raise ValueError(f"instant {instant} not in times (len={len(times)})")
         ax.axvline(df_bands.index[instant], color="k", ls="--", lw=0.8)  # marks the instant from plot 1
     ax.set_ylabel("Band level (dB, uncalibrated)")
@@ -277,6 +461,38 @@ def plot_bands_timeserie(times: list[pd.Timestamp], freqs: list[float], psds: li
     plt.show()
 
 def acoustic_events(times: list[pd.Timestamp], band_level:float, baseline_hours=6, thresh_db=6.0, min_minutes=3)-> tuple[pd.DataFrame, np.ndarray[float],np.ndarray[float] ]:
+    """Detect loud events, such as passing ships, in a band-level time series.
+
+    The baseline is a centred rolling median over ``baseline_hours``. An event
+    is a run of points at least ``thresh_db`` above the baseline, with no gap
+    longer than 5 minutes between consecutive points, lasting at least
+    ``min_minutes`` (counted from the first to the last point's start time,
+    plus one minute).
+
+    Parameters
+    ----------
+    times : array-like of pandas.Timestamp
+        Time of each value, sorted.
+    band_level : array-like
+        Band level in dB at each time, e.g. ``band_levels(...)["tol_63Hz"]``.
+    baseline_hours : float, default 6
+        Width of the rolling-median window.
+    thresh_db : float, default 6.0
+        Minimum excess over the baseline, in dB.
+    min_minutes : int, default 3
+        Minimum event duration, in minutes.
+
+    Returns
+    -------
+    events : pandas.DataFrame
+        One row per event, with columns ``start``, ``end``, ``peak_time``,
+        ``peak_level`` (dB) and ``peak_excess`` (dB over baseline).
+        Empty (no columns) if nothing is detected.
+    baseline : numpy.ndarray
+        Rolling-median baseline at each time, in dB.
+    excess : numpy.ndarray
+        ``band_level - baseline`` at each time, in dB.
+    """
     s = pd.Series(band_level, index=pd.DatetimeIndex(times))
     win = f"{int(baseline_hours * 60)}min"
     base = s.rolling(win, center=True, min_periods=5).median()
