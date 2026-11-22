@@ -30,7 +30,7 @@ from typing import Optional
 
 import pandas as pd
 
-from gc_files import GCStore
+from gc_files import GCStore, Store
 
 logger = logging.getLogger(__name__)
 
@@ -241,12 +241,13 @@ class DeploymentMetadata:
         )
 
     @classmethod
-    def from_store(cls, store: GCStore, path: str) -> "DeploymentMetadata":
+    def from_store(cls, store: Store, path: str) -> "DeploymentMetadata":
         """Load a metadata JSON from the bucket.
 
         Parameters
         ----------
-        store : GCStore
+        store : Store
+            :class:`GCStore` or :class:`LocalStore`.
         path : str
             Blob name, e.g.
             ``"sefsc/audio/gomex/ef/sefsc_gomex_ef_01/metadata/SEFSC_GOMx_EF_01.json"``.
@@ -260,7 +261,7 @@ class DeploymentMetadata:
         return meta
 
     @classmethod
-    def for_audio_file(cls, store: GCStore, audio_filename: str) -> "DeploymentMetadata":
+    def for_audio_file(cls, store: Store, audio_filename: str) -> "DeploymentMetadata":
         """Load the metadata of the deployment an audio file belongs to.
 
         The deployment folder is the part of the path before ``/audio/``; its
@@ -320,7 +321,7 @@ class DeploymentMetadata:
             raise ValueError(f"{self.collection_name}: no deployment position in metadata")
         return BBox.around(self.latitude, self.longitude, radius_km)
 
-    def calibration_files(self, store: GCStore) -> list[str]:
+    def calibration_files(self, store: Store) -> list[str]:
         """Calibration transfer-function files (``*.tf``) of this deployment.
 
         Download one with ``store.download(path)`` and pass the local path as
@@ -343,3 +344,63 @@ def deployment_folder(audio_filename: str) -> str:
     if not sep:
         raise FileNotFoundError(f"cannot find the deployment folder of {os.path.basename(audio_filename)}")
     return head + "/"
+
+
+def download_with_metadata(
+    store: GCStore,
+    audio_files: list[str],
+    dest_dir: str = "downloads",
+    calibration: bool = True,
+    workers: int = 4,
+    overwrite: bool = False,
+) -> list[str]:
+    """Download audio files together with their deployments' metadata.
+
+    For every deployment the audio files belong to, also downloads its
+    ``metadata/*.json`` and, if ``calibration``, its
+    ``ancillary/calibration/*.tf`` files. Bucket paths are kept under
+    ``dest_dir``, so the copy can be read offline with ``LocalStore(dest_dir)``
+    exactly as the bucket is read with ``GCStore``. Files already downloaded
+    with the right size are skipped.
+
+    Parameters
+    ----------
+    store : GCStore
+        Bucket to download from.
+    audio_files : list[str]
+        Audio blob names, e.g. from ``GCStore.filter_files``.
+    dest_dir : str, default "downloads"
+        Local folder standing for the bucket root.
+    calibration : bool, default True
+        Also download the calibration transfer functions.
+    workers : int, default 4
+        Files downloaded in parallel. Audio files are 250-300 MB each.
+    overwrite : bool, default False
+        Download again even if a complete local copy exists.
+
+    Returns
+    -------
+    list[str]
+        Local paths of the audio files, in input order.
+
+    Examples
+    --------
+    >>> download_with_metadata(store, files[:3])
+    >>> local = LocalStore("downloads")
+    >>> meta = DeploymentMetadata.for_audio_file(local, files[0])
+    >>> aud = AudioFile(files[0], local)
+    """
+    folders = sorted({deployment_folder(f) for f in audio_files})
+    extra = []
+    for root in folders:
+        extra += store.list_files(prefix=root + "metadata/", suffix=".json")
+        if calibration:
+            extra += store.list_files(prefix=root + "ancillary/calibration/", suffix=".tf")
+    logger.info(
+        "Downloading %d audio file(s) and %d metadata/calibration file(s) from %d deployment(s) to %s",
+        len(audio_files), len(extra), len(folders), dest_dir,
+    )
+    store.download_files(extra, dest_dir=dest_dir, keep_path=True, overwrite=overwrite)
+    return store.download_files(
+        audio_files, dest_dir=dest_dir, keep_path=True, overwrite=overwrite, workers=workers
+    )

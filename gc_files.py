@@ -3,15 +3,21 @@
 Also parses recording start times from file names (ISO, HARP and SoundTrap
 naming styles).
 """
+import io
 import os
 import re
 import json
-from typing import Optional
+import time
+import logging
+import threading
+from typing import Optional, Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 import pandas as pd
 from google.cloud import storage
 from google.cloud.storage.fileio import BlobReader
+
+logger = logging.getLogger(__name__)
 
 _TIME_PATTERNS = [
     # 20190908T060000 / 20190908_060000 / 20190908-060000
@@ -38,6 +44,49 @@ class AudioExtenstion(StrEnum):
     AIF = "aif"
     AIFF = "aiff"
 
+@runtime_checkable
+class Store(Protocol):
+    """Read access to files laid out like the bucket, wherever they are.
+
+    :class:`GCStore` (the bucket) and :class:`LocalStore` (a downloaded copy)
+    both follow this protocol, so any code typed with ``Store`` works on
+    either. File names are always bucket-style paths with ``/``, e.g.
+    ``"sefsc/audio/gomex/ef/sefsc_gomex_ef_01/audio/GOM_EF_01_160723_162002.x.flac"``.
+
+    Any class with these methods is a ``Store``; no inheritance needed.
+    ``isinstance(x, Store)`` checks that the methods exist (not their
+    signatures).
+    """
+
+    def open_file(self, filename: str) -> io.BufferedIOBase:
+        """Open a file as a seekable binary stream."""
+        ...
+
+    def read_json(self, filename: str) -> dict:
+        """Read and parse a JSON file."""
+        ...
+
+    def list_files(
+        self, prefix: str, suffix: Optional[str] = None, limit: Optional[int] = None
+    ) -> list[str]:
+        """Recursively list file names starting with ``prefix``."""
+        ...
+
+    def list_folders(self, prefix: str) -> tuple[list[str], list[tuple[str, int]]]:
+        """Sub-folders and ``(name, size)`` of files directly under ``prefix``."""
+        ...
+
+    def download(
+        self,
+        filename: str,
+        dest_dir: str = "downloads",
+        keep_path: bool = False,
+        overwrite: bool = False,
+    ) -> str:
+        """Make a file available locally and return its local path."""
+        ...
+
+
 class GCStore:
     """Read-only access to a public Google Cloud Storage bucket.
 
@@ -59,7 +108,7 @@ class GCStore:
         self.client: storage.Client = storage.Client.create_anonymous_client()
         self.bucket: storage.Bucket = self.client.bucket(bucket)
 
-    def list_folders(self, prefix: str):
+    def list_folders(self, prefix: str) -> tuple[list[str], list[tuple[str, int]]]:
         """List what sits directly under a prefix, like browsing the GCS console.
 
         Parameters
@@ -106,8 +155,17 @@ class GCStore:
                 break
         return out
 
-    def download(self, filename: str, dest_dir="downloads"):
-        """Download one blob to ``dest_dir``, keeping its base name.
+    def download(
+        self,
+        filename: str,
+        dest_dir: str = "downloads",
+        keep_path: bool = False,
+        overwrite: bool = False,
+    ) -> str:
+        """Download one blob to ``dest_dir``.
+
+        The file is written to ``<dest>.part`` and renamed when complete, so an
+        interrupted download is never mistaken for a finished one.
 
         Parameters
         ----------
@@ -115,21 +173,67 @@ class GCStore:
             Full blob name in the bucket.
         dest_dir : str, default "downloads"
             Local directory, created if missing.
+        keep_path : bool, default False
+            ``True`` keeps the blob's full path under ``dest_dir``, so the
+            local copy mirrors the bucket and can be read with
+            ``LocalStore(dest_dir)``. ``False`` keeps only the base name.
+        overwrite : bool, default False
+            Download again even if a file of the same size is already there.
 
         Returns
         -------
         str
             Local path of the downloaded file.
         """
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, os.path.basename(filename))
-        self.bucket.blob(filename).download_to_filename(dest)
+        rel = filename if keep_path else os.path.basename(filename)
+        dest = os.path.join(dest_dir, rel)
+        blob = self.bucket.blob(filename)
+        if not overwrite and os.path.exists(dest):
+            blob.reload()
+            if blob.size == os.path.getsize(dest):
+                logger.debug("%s: already downloaded", os.path.basename(dest))
+                return dest
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        t_start = time.perf_counter()
+        part = dest + ".part"
+        try:
+            blob.download_to_filename(part)
+        except BaseException:
+            if os.path.exists(part):
+                os.remove(part)
+            raise
+        os.replace(part, dest)
+        logger.info(
+            "%s: downloaded %.0f MB in %.0f s",
+            os.path.basename(dest), os.path.getsize(dest) / 1e6, time.perf_counter() - t_start,
+        )
         return dest
 
-    def download_files(self, filenames: list[str], dest_dir="downloads"):
-        """Download several blobs one after another with :meth:`download`."""
-        for filename in filenames:
-            self.download(filename=filename, dest_dir=dest_dir)
+    def download_files(
+        self,
+        filenames: list[str],
+        dest_dir: str = "downloads",
+        keep_path: bool = False,
+        overwrite: bool = False,
+        workers: int = 1,
+    ) -> list[str]:
+        """Download several blobs with :meth:`download`.
+
+        With ``workers > 1``, files are downloaded in parallel threads, each
+        with its own GCS client. Returns the local paths, in input order.
+        """
+        if workers <= 1:
+            return [self.download(f, dest_dir, keep_path, overwrite) for f in filenames]
+        local = threading.local()
+        bucket = self.bucket.name
+
+        def one(f):
+            if not hasattr(local, "store"):
+                local.store = GCStore(bucket)
+            return local.store.download(f, dest_dir, keep_path, overwrite)
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(one, filenames))
 
     def download_to_memory(
         self, blob, chunk_size=32 * 1024 * 1024, workers=8
@@ -288,3 +392,88 @@ class GCStore:
                     continue
         return None
 
+
+class LocalStore:
+    """Read files from a local folder that mirrors a bucket.
+
+    Has the same reading interface as :class:`GCStore` (``open_file``,
+    ``list_files``, ``list_folders``, ``read_json``), so :class:`AudioFile`,
+    ``DeploymentMetadata`` and the spectrum functions work on downloaded data
+    without network access. Blob names are paths relative to ``root``; use
+    ``GCStore.download(..., keep_path=True)`` or ``download_with_metadata`` to
+    build such a folder. Safe to share between threads.
+
+    Parameters
+    ----------
+    root : str
+        Local folder standing for the bucket root, e.g. ``"downloads"``.
+    """
+
+    def __init__(self, root: str = "downloads"):
+        self.root = root
+
+    def _path(self, filename: str) -> str:
+        return os.path.join(self.root, filename)
+
+    def open_file(self, filename: str) -> io.BufferedIOBase:
+        """Open a local file in binary mode."""
+        return open(self._path(filename), "rb")
+
+    def read_json(self, filename: str) -> dict:
+        """Read and parse a local JSON file."""
+        with open(self._path(filename), "rb") as f:
+            return json.load(f)
+
+    def list_files(
+        self, prefix: str, suffix: Optional[str] = None, limit: Optional[int] = None
+    ) -> list[str]:
+        """Recursively list files whose relative path starts with ``prefix``.
+
+        Same arguments and result as :meth:`GCStore.list_files`; names use
+        ``/`` and are relative to ``root``. Unfinished ``.part`` downloads are
+        skipped.
+        """
+        base = os.path.dirname(prefix) if not prefix.endswith("/") else prefix
+        start = self._path(base)
+        out = []
+        if not os.path.isdir(start):
+            return out
+        for dirpath, _, names in os.walk(start):
+            for n in sorted(names):
+                rel = os.path.relpath(os.path.join(dirpath, n), self.root).replace(os.sep, "/")
+                if not rel.startswith(prefix) or rel.endswith(".part"):
+                    continue
+                if suffix and not rel.lower().endswith(suffix):
+                    continue
+                out.append(rel)
+                if limit and len(out) >= limit:
+                    return sorted(out)
+        return sorted(out)
+
+    def list_folders(self, prefix: str) -> tuple[list[str], list[tuple[str, int]]]:
+        """Sub-folders and files directly under ``prefix``, like :meth:`GCStore.list_folders`."""
+        path = self._path(prefix)
+        if not os.path.isdir(path):
+            return [], []
+        folders, files = [], []
+        for n in sorted(os.listdir(path)):
+            rel = prefix + n
+            if os.path.isdir(os.path.join(path, n)):
+                folders.append(rel + "/")
+            else:
+                files.append((rel, os.path.getsize(os.path.join(path, n))))
+        return folders, files
+
+    def download(
+        self,
+        filename: str,
+        dest_dir: str = "downloads",
+        keep_path: bool = False,
+        overwrite: bool = False,
+    ) -> str:
+        """Return the local path of ``filename``.
+
+        The file is already local, so nothing is copied and the other
+        arguments are ignored; they are there to match :class:`Store`.
+        """
+        return self._path(filename)

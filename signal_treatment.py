@@ -8,14 +8,17 @@ import time
 import threading
 from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import signal
 
 from audio_files import AudioFile, logger
-from gc_files import GCStore
+from gc_files import GCStore, Store
+
+if TYPE_CHECKING:
+    from recording import Catalog
 
 def _decimator(fs_in: int, fs_out: int):
     """Build a resampler from ``fs_in`` down to about ``fs_out`` Hz.
@@ -30,7 +33,7 @@ def _decimator(fs_in: int, fs_out: int):
     return fs_eff, (lambda x: signal.resample_poly(x, r.numerator, r.denominator))
 
 
-def load_calibration(tf_path, freqs, gain_db):
+def load_calibration(tf_filepath:str, freqs:np.ndarray[float], gain_db:float):
     """Build the dB correction to add to a PSD.
 
     Parameters
@@ -50,8 +53,8 @@ def load_calibration(tf_path, freqs, gain_db):
         Correction in dB, same shape as ``freqs``.
     """
     cal = np.full(freqs.shape, float(gain_db or 0.0))
-    if tf_path:
-        tf = np.loadtxt(tf_path, comments=("#", "%"), delimiter=None, usecols=(0, 1))
+    if tf_filepath:
+        tf = np.loadtxt(tf_filepath, comments=("#", "%"), delimiter=None, usecols=(0, 1))
         cal += np.interp(freqs, tf[:, 0], tf[:, 1])
     return cal
 
@@ -61,9 +64,9 @@ def extract_spectral_distribution(
     t1: pd.Timestamp,
     seconds_per_minute: float = 10.0,
     fmax: float = 1000.0,
-    tf=None,
+    tf_filepath:str=None,
     gain_db: float = 0.0,
-) -> tuple[list[pd.Timestamp], np.ndarray, list[np.ndarray]]:
+) -> tuple[list[pd.Timestamp], np.ndarray[float], list[np.ndarray[float]]]:
     """Compute one power spectral density per minute of a single file.
 
     At each minute in ``[t0, t1]`` (counted from the start of each segment),
@@ -157,8 +160,8 @@ def extract_spectral_distribution(
         len(audio_file.audio_data.segments),
         n_used,
     )
-    if rows and (tf or gain_db):
-        cal = load_calibration(tf, freqs, gain_db)
+    if rows and (tf_filepath or gain_db):
+        cal = load_calibration(tf_filepath, freqs, gain_db)
         rows = [r + cal for r in rows]
     return times, freqs, rows
 
@@ -167,17 +170,25 @@ def extract_spectrum_multiple_files(
     audio_files: list[AudioFile | str],
     t0: pd.Timestamp,
     t1: pd.Timestamp,
-    store=None,
+    store: Optional[Store] = None,
     seconds_per_minute: float = 10.0,
     fmax: float = 1000.0,
     tf=None,
     gain_db: float = 0.0,
     workers: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    catalog: Optional["Catalog"] = None,
+    deployed_only: bool = True,
+) -> tuple[np.ndarray[pd.Timestamp], np.ndarray[float], np.ndarray[np.ndarray[float]], bool]:
     """Compute per-minute spectra over several files, merged and sorted by time.
 
-    Runs :func:`extract_spectral_distribution` on each file, checks that all
-    files give the same frequency grid, then applies calibration.
+    Runs :func:`extract_spectral_distribution` on each file, calibrates it,
+    checks that all files give the same frequency grid, and merges the
+    results into one time series.
+
+    With a ``catalog``, each file is calibrated with the transfer function of
+    its own deployment, and (with ``deployed_only``) its window is trimmed to
+    the time the instrument was on the seafloor, so files from several
+    deployments can be mixed.
 
     Parameters
     ----------
@@ -187,19 +198,27 @@ def extract_spectrum_multiple_files(
         prefer them, so streams are not held open in advance.
     t0, t1 : pandas.Timestamp
         Time window.
-    store : GCStore, optional
-        Required when ``audio_files`` contains blob names.
+    store : Store, optional
+        :class:`GCStore` or :class:`LocalStore`; required when
+        ``audio_files`` contains blob names.
     seconds_per_minute : float, default 10.0
         Seconds of audio analysed at the start of each minute.
     fmax : float, default 1000.0
         Highest frequency kept, in Hz.
     tf : str, optional
-        Calibration file, see :func:`load_calibration`.
+        Calibration file for all files, see :func:`load_calibration`. Not
+        allowed with ``catalog``, which gives each file its own.
     gain_db : float, default 0.0
-        Constant calibration offset, in dB.
+        Constant calibration offset, in dB, added to every file.
     workers : int, default 1
         Number of files processed in parallel threads. At most ``workers``
         GCS streams are open at once, and each thread gets its own GCS client.
+    catalog : recording.Catalog, optional
+        Gives each file's deployment metadata and calibration file. Its store
+        is used when ``store`` is not given.
+    deployed_only : bool, default True
+        With ``catalog``: analyse only between deployment and recovery time,
+        skipping deck tests. Ignored without ``catalog``.
 
     Returns
     -------
@@ -210,18 +229,34 @@ def extract_spectrum_multiple_files(
     psd : numpy.ndarray of float32
         PSD in dB, shape ``(n_times, n_freqs)``.
     calibrated : bool
-        ``True`` if ``tf`` or ``gain_db`` was applied.
+        ``True`` if every file was calibrated (``tf``, ``gain_db`` or the
+        catalog's transfer functions).
 
     Raises
     ------
     ValueError
-        If blob names are given without ``store``, if files give different
-        frequency grids (sample rate below ``2 * fmax``), or if no file has
-        audio in the window.
+        If blob names are given without ``store`` or ``catalog``, if both
+        ``tf`` and ``catalog`` are given, if files give different frequency
+        grids (sample rate below ``2 * fmax``), if calibrated and uncalibrated
+        files would be mixed, or if no file has audio in the window.
+
+    Examples
+    --------
+    >>> catalog = Catalog(LocalStore("downloads"))
+    >>> times, freqs, psd, calibrated = extract_spectrum_multiple_files(
+    ...     files, t0, t1, catalog=catalog, workers=4)
     """
     n = len(audio_files)
+    names = [os.path.basename(p if isinstance(p, str) else p.filename) for p in audio_files]
+    if catalog is not None:
+        if tf is not None:
+            raise ValueError("pass either `tf` or `catalog`, not both: the catalog gives each file its own")
+        store = store or catalog.store
+        # Load metadata and calibration once per deployment, here, before threads start
+        for p in audio_files:
+            catalog.calibration_filepath(p if isinstance(p, str) else p.filename)
     if store is None and any(isinstance(p, str) for p in audio_files):
-        raise ValueError("pass `store` when audio_files contains paths")
+        raise ValueError("pass `store` or `catalog` when audio_files contains paths")
     workers = max(1, min(workers, n))
     t_start = time.perf_counter()
     logger.info(
@@ -233,41 +268,64 @@ def extract_spectrum_multiple_files(
 
     def thread_store():
         # google-cloud-storage clients are not guaranteed thread-safe: one per thread
-        if workers == 1:
-            return store
+        if workers == 1 or not isinstance(store, GCStore):
+            return store  # LocalStore opens plain files: safe to share
         if not hasattr(local, "store"):
             local.store = GCStore(bucket=store.bucket.name)
         return local.store
 
-    def process(i: int, p: AudioFile | str):
-        name = os.path.basename(p if isinstance(p, str) else p.filename)
+    def file_settings(audio_file: AudioFile | str)->tuple[pd.Timestamp, pd.Timestamp, str|None]:
+        """(t0, t1, tf) for one file: the catalog's deployment window and calibration."""
+        if catalog is None:
+            return t0, t1, tf
+        blob = audio_file if isinstance(audio_file, str) else audio_file.filename
+        start, end = t0, t1
+        if deployed_only:
+            meta = catalog.metadata(blob)
+            if meta.deployment_time is not None:
+                start = max(start, meta.deployment_time)
+            if meta.recovery_time is not None:
+                end = min(end, meta.recovery_time)
+        return start, end, catalog.calibration_filepath(blob)
+
+    def process(i: int, audio_file: AudioFile | str)->tuple[str, np.ndarray[pd.Timestamp], np.ndarray[float], list[np.ndarray[float]], str|None ]:
+        name = names[i]
+        start, end, file_tf = file_settings(audio_file)
+        file_cal = bool(file_tf) or bool(gain_db)
+        if start > end:
+            logger.info("[%d/%d] %s: outside deployment period, skipped", i + 1, n, name)
+            if not isinstance(audio_file, str):
+                audio_file.close()
+            return name, [], None, [], file_cal
         t_file = time.perf_counter()
         logger.debug("[%d/%d] opening %s", i + 1, n, name)
         try:
-            if isinstance(p, str):
-                p = AudioFile(filename=p, store=thread_store())
+            if isinstance(audio_file, str):
+                audio_file = AudioFile(filename=audio_file, store=thread_store())
             try:
-                tms, frqs, rws = extract_spectral_distribution(
-                    audio_file=p,
-                    t0=t0,
-                    t1=t1,
+                times, freqs, psds = extract_spectral_distribution(
+                    audio_file=audio_file,
+                    t0=start,
+                    t1=end,
                     seconds_per_minute=seconds_per_minute,
                     fmax=fmax,
+                    tf_filepath=file_tf,
+                    gain_db=gain_db,
                 )
             finally:
-                p.close()  # free the GCS stream; read() reopens it if needed later
+                audio_file.close()  # free the GCS stream; read() reopens it if needed later
         except Exception:
             logger.exception("[%d/%d] %s: extraction failed", i + 1, n, name)
             raise
         elapsed = time.perf_counter() - t_file
-        if not rws:
+        if not psds:
             logger.warning("[%d/%d] %s: no audio in window, skipped (%.1f s)", i + 1, n, name, elapsed)
         else:
             logger.info(
                 "[%d/%d] %s: %d minute(s), %s -> %s (%.1f s)",
-                i + 1, n, name, len(rws), tms[0], tms[-1], elapsed,
+                i + 1, n, name, len(psds), times[0], times[-1], elapsed,
             )
-        return name, tms, frqs, rws
+        return name, times, freqs, psds, file_cal
 
     if workers == 1:
         results = [process(i, p) for i, p in enumerate(audio_files)]
@@ -284,10 +342,12 @@ def extract_spectrum_multiple_files(
     rows: list[np.ndarray] = []
     freqs = None
     skipped: list[str] = []
-    for name, tms, frqs, rws in results:
+    cal_flags: set[bool] = set()
+    for name, tms, frqs, rws, file_cal in results:
         if not rws:
             skipped.append(name)
             continue
+        cal_flags.add(file_cal)
         if freqs is None:
             freqs = frqs
         elif len(frqs) != len(freqs) or not np.allclose(frqs, freqs):
@@ -302,11 +362,14 @@ def extract_spectrum_multiple_files(
         raise ValueError(f"No audio between {t0} and {t1} in {n} file(s).")
     order = np.argsort(np.array(times, dtype="datetime64[ns]"))
     t = np.array(times, dtype="datetime64[ns]")[order]
-    psd = np.vstack(rows)[order]
+    psd = np.vstack(rows)[order].astype(np.float32)
 
-    cal = load_calibration(tf, freqs, gain_db)
-    psd = (psd + cal).astype(np.float32)
-    calibrated = bool(tf) or bool(gain_db)
+    if len(cal_flags) > 1:
+        raise ValueError(
+            "some files are calibrated and others are not (a deployment has no "
+            "calibration file?); their levels cannot be compared"
+        )
+    calibrated = cal_flags == {True}
     logger.info(
         "Done: %d spectra x %d bins from %d/%d file(s)%s, %s, %.1f s total",
         psd.shape[0], psd.shape[1], n - len(skipped), n,

@@ -13,7 +13,7 @@ import numpy as np
 from google.cloud.storage.fileio import BlobReader
 import soundfile as sf
 
-from gc_files import GCStore, AudioExtenstion
+from gc_files import GCStore, AudioExtenstion, Store
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +122,9 @@ class AudioFile:
     ----------
     filename : str
         Full blob name in the store's bucket.
-    store : GCStore
-        Store the file is read from.
+    store : Store
+        Where the file is read from: :class:`GCStore` (the bucket) or
+        :class:`LocalStore` (a downloaded copy).
 
     Attributes
     ----------
@@ -152,10 +153,10 @@ class AudioFile:
     ...     x = af.read(seg, frame_off=0, n=10 * af.audio_data.sample_rate)
     """
 
-    def __init__(self, filename: str, store: GCStore):
+    def __init__(self, filename: str, store: Store):
         self.filename: str = filename
         self.name: str = os.path.basename(filename)
-        self.store: GCStore = store
+        self.store: Store = store
         logger.debug("%s: opening GCS stream", self.name)
         self.reader: BlobReader = store.open_file(filename=filename)
         self.kind: AudioExtenstion = GCStore.audio_file_extention(filename)
