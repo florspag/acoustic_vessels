@@ -27,13 +27,19 @@ class AISData:
     base_date_time : pandas.Timestamp
         Time of the report, UTC.
     latitude, longitude : float
-        Position in decimal degrees.
+        Position in decimal degrees. 91 / 181 mean "not available" in AIS;
+        they are kept as is, but any bounding box drops them.
     sog : float, optional
-        Speed over ground, in knots.
+        Speed over ground, in knots (0-102.2; 102.2 means 102.2 kn or more).
+        ``None`` / NaN when not available (102.3 in the source).
     cog : float, optional
-        Course over ground, in degrees.
+        Course over ground, in degrees (0-359.9). ``None`` / NaN when not
+        available (360 in the source).
     heading : float, optional
-        True heading, in degrees.
+        True heading, in degrees (0-359). ``None`` / NaN when not available
+        (511 in the source; common on small vessels with no gyro compass
+        connected to the transponder).
+
     vessel_name, imo, call_sign : str, optional
         Identification, when broadcast.
     vessel_type : int, optional
@@ -49,6 +55,26 @@ class AISData:
         Dimensions, in metres.
     cargo : float, optional
         Cargo / hazard code.
+
+    Notes
+    -----
+    AIS messages (ITU-R M.1371) encode each field as a fixed-size integer, so
+    a missing value cannot be left blank: the transponder sends a reserved
+    "not available" code instead. MarineCadastre keeps these codes as numbers.
+
+    ========= ========================= ============ ================
+    Field     Encoding                  Valid range  "Not available"
+    ========= ========================= ============ ================
+    heading   9 bits, whole degrees     0-359        511 (2**9 - 1)
+    cog       12 bits, 0.1 degree       0-3599       3600 (360.0 deg)
+    sog       10 bits, 0.1 knot         0-1022       1023 (102.3 kn)
+    latitude  27 bits, 1/10000 minute   -90 to 90    91 deg
+    longitude 28 bits, 1/10000 minute   -180 to 180  181 deg
+    ========= ========================= ============ ================
+
+    Left in, these codes would read as real values: a mean heading pulled
+    towards 511 deg, or a missing speed counted as 102 kn. :meth:`AIS.read_ais_day`
+    turns the heading, course and speed codes into NaN so pandas skips them.
     """
 
     mmsi: str
@@ -241,8 +267,10 @@ class AIS:
         """Read one daily AIS zip, keeping only the rows that match the filters.
 
         The CSV is streamed in chunks, so memory use is bounded by ``chunksize``
-        rows plus the rows kept. "Not available" codes are turned into NaN:
-        heading 511, course 360 or more, speed 102.3 knots or more.
+        rows plus the rows kept. AIS "not available" codes are turned into NaN:
+        heading 511, course 360 or more (3600 tenths of a degree; higher values
+        are not allowed), speed 102.3 knots or more (1023 tenths of a knot).
+        See the Notes of :class:`AISData` for why these codes exist.
 
         Parameters
         ----------
