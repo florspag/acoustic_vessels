@@ -6,11 +6,11 @@ ship-noise frequency bands, plots, and detection of loud events.
 import os
 import time
 import threading
+from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import numpy as np
 import pandas as pd
-from fractions import Fraction
 import matplotlib.pyplot as plt
 from scipy import signal
 
