@@ -41,7 +41,9 @@ class Recording:
         Metadata of the deployment the file belongs to.
     tf : str or None
         Local path of the calibration transfer function, ready to pass as
-        ``tf=`` to the spectrum functions; ``None`` if the deployment has none.
+        ``tf_filepath=`` to ``extract_spectral_distribution``; ``None`` if the
+        deployment has none. ``extract_spectrum_multiple_files(..., catalog=...)``
+        picks it up by itself.
     """
 
     audio: AudioFile

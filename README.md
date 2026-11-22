@@ -18,13 +18,14 @@ No credentials are needed. The GCS bucket is public, so `GCStore` uses an anonym
 
 | File | Contents |
 | --- | --- |
-| `gc_files.py` | `GCStore`: lists, filters and streams files from a GCS bucket. Also the `AudioExtenstion` enum and parsing of timestamps from file names (ISO, HARP and SoundTrap styles). |
+| `gc_files.py` | `GCStore` (the GCS bucket) and `LocalStore` (a downloaded copy) list, filter and open files. Both follow the `Store` protocol, so the rest of the code works on either. Also the `AudioExtenstion` enum and parsing of timestamps from file names (ISO, HARP and SoundTrap styles). |
 | `audio_files.py` | `AudioFile`: random-access reader over a GCS stream. It parses WAV/RIFF headers and Triton XWAV `harp` chunks (duty-cycled segments, site metadata), so a read fetches only the bytes it needs. FLAC, AIFF and other formats go through `soundfile`. |
 | `signal_treatment.py` | Spectral analysis: decimation, Welch PSD, calibration, band levels, plots, and detection of loud events. |
-| `deployment_metadata.py` | `DeploymentMetadata`: each deployment's metadata JSON (position, depth, deployment and recovery times, sample rate, duty cycle, data-quality periods), plus its calibration files. |
+| `deployment_metadata.py` | `DeploymentMetadata`: each deployment's metadata JSON (position, depth, deployment and recovery times, sample rate, duty cycle, data-quality periods), plus its calibration files. `download_with_metadata` downloads audio files together with their metadata and calibration. |
+| `recording.py` | `Catalog`: opens audio files from one store together with their deployment's metadata and calibration file, cached per deployment. `Recording` is one such bundle. |
 | `ais_data.py` | `AIS`: downloads and filters daily AIS files from MarineCadastre.gov. `AISData` is one position report, `BBox` a search area. |
 | `vessel.ipynb` | Worked example from start to finish. |
-| `downloads/` | Local copies of audio files fetched with `GCStore.download`, and the AIS cache in `downloads/ais/`. Not tracked in git. |
+| `downloads/` | Local copy of the bucket (audio, metadata, calibration, keeping bucket paths) for `LocalStore`, and the AIS cache in `downloads/ais/`. Not tracked in git. |
 
 ## Usage
 
@@ -67,20 +68,25 @@ plot_bands_timeserie(times, freqs, psds, bands_def, instant=i)
 
 To keep only one site, filter on the base name, e.g. `fnmatch(os.path.basename(f), "GOM_EF*")`. To get the start and end of a file's audio, use `aud.time_range()`.
 
-### Several files, in parallel
+### Several files, calibrated, in parallel
 
 ```python
+from recording import Catalog
 from signal_treatment import extract_spectrum_multiple_files
 
+catalog = Catalog(store)    # or Catalog(LocalStore("downloads")), see "Working offline"
 times, freqs, psd, calibrated = extract_spectrum_multiple_files(
     audio_files=files,      # bucket paths, opened and closed one at a time
     t0=t0, t1=t1,
-    store=store,
+    catalog=catalog,        # metadata and calibration of each file's deployment
     workers=8,              # files processed in parallel threads
 )
 ```
 
-- **Output**: results are merged and sorted by time, then calibrated. `psd` has shape `(n_times, n_freqs)`.
+- **Output**: one time series for all files, merged and sorted by time. `psd` has shape `(n_times, n_freqs)`.
+- **Calibration**: each file is calibrated with its own deployment's transfer function, so the list can span several deployments. If some deployments have a calibration file and others don't, the function raises a `ValueError` rather than mix absolute and relative levels.
+- **Deck tests**: with `deployed_only=True` (the default), each file's window is trimmed to the time between deployment and recovery.
+- **Without a catalog**: pass `store=store`, plus optionally `tf=` for one calibration file applied to all files. `tf` and `catalog` can't be used together.
 - **Skipped files**: files with no audio in the window are skipped with a warning.
 - **Frequency grids**: if the files give different grids (sample rate below `2 × fmax`), the function raises a `ValueError` that names the file.
 - **Threads**: each thread uses its own GCS client, and at most `workers` streams are open at once. `workers=4` to `8` is a reasonable start.
@@ -127,6 +133,43 @@ Before analysing a deployment, check two things:
 - **Deck tests.** Audio can start days before the instrument reaches the seafloor. For EF_01, audio starts on 2016-07-16 but the deployment is on 2016-07-21 06:00, so the first file was recorded on the ship. Skip any time where `meta.is_deployed(t)` is `False`.
 - **Quality by frequency.** `meta.quality` lists periods and frequency bands rated `Good`, `Unverified` or `Unusable`. For EF_01, calibration is only `Good` from 50 to 600 Hz. The third-octave bands at 63–500 Hz are fine, but the broadband 20–500 Hz band starts in the unverified range.
 
+### Working offline
+
+`download_with_metadata` downloads audio files together with each deployment's metadata JSON and calibration files. It keeps their bucket paths under `dest_dir`, so `LocalStore` reads the copy exactly as `GCStore` reads the bucket:
+
+```python
+from gc_files import LocalStore
+from deployment_metadata import download_with_metadata
+
+download_with_metadata(store, files, dest_dir="downloads", workers=4)   # skips files already there
+
+catalog = Catalog(LocalStore("downloads"))   # same code as above, no network needed
+times, freqs, psd, calibrated = extract_spectrum_multiple_files(files, t0, t1, catalog=catalog, workers=4)
+```
+
+```text
+downloads/sefsc/audio/gomex/ef/sefsc_gomex_ef_01/
+    audio/GOM_EF_01_160723_162002.x.flac
+    metadata/SEFSC_GOMx_EF_01.json
+    ancillary/calibration/828_160707_B_HARP.tf
+```
+
+Each audio file is 250–300 MB, so a whole EF_01 deployment is about 50 GB. Filter by date before downloading. Downloads go to a `.part` file that is renamed once complete, so an interrupted download is never taken for a complete file.
+
+`GCStore`, `LocalStore` and anything else with the same methods (`open_file`, `read_json`, `list_files`, `list_folders`, `download`) satisfy the `Store` protocol in `gc_files.py`. A small fake store for tests counts too.
+
+### One recording at a time
+
+`Catalog.recordings` yields a `Recording` per file: the `AudioFile`, its `DeploymentMetadata`, and the local path of its calibration file.
+
+```python
+for rec in catalog.recordings(files, deployed_only=True):   # skips files recorded entirely on deck
+    with rec:                                                # closes the audio stream
+        print(rec.audio.name, rec.deployed_range, rec.meta.site, rec.tf)
+```
+
+Use it to inspect files or to run a custom analysis on each one. To get spectra over time, use `extract_spectrum_multiple_files(..., catalog=catalog)` rather than looping, so the results are merged. For a single file, the calibration path is `catalog.calibration_filepath(filename)`, which you pass to `extract_spectral_distribution(..., tf_filepath=...)`.
+
 ### AIS vessel positions
 
 ```python
@@ -154,19 +197,19 @@ These settings suit noise monitoring. Telling vessel types apart needs more: con
 
 ## Calibration
 
-Without calibration, levels are relative: dB re 1 ADC count²/Hz. To get absolute levels in dB re 1 µPa²/Hz, pass either or both of the following to `extract_spectral_distribution` or `extract_spectrum_multiple_files`:
+Without calibration, levels are relative: dB re 1 ADC count²/Hz. Absolute levels in dB re 1 µPa²/Hz come from a transfer function: a two-column text file (frequency in Hz, correction in dB) interpolated onto the PSD frequencies.
 
-- `gain_db`: a constant offset for the whole system.
-- `tf`: the path to a two-column text file (frequency in Hz, correction in dB). The correction is interpolated onto the PSD frequencies.
+Each deployment's transfer functions are in its `ancillary/calibration/` folder, named after the hydrophone preamplifier (`meta.preamp_ids`), e.g. `828_160707_B_HARP.tf`. There are three ways to apply one:
 
-Each deployment's transfer functions are in its `ancillary/calibration/` folder, named after the hydrophone preamplifier (`meta.preamp_ids`):
+| How | Calibration used |
+| --- | --- |
+| `extract_spectrum_multiple_files(files, t0, t1, catalog=catalog)` | Each file's own deployment. Recommended. |
+| `extract_spectrum_multiple_files(files, t0, t1, store=store, tf=path)` | One local `.tf` file for all files |
+| `extract_spectral_distribution(audio, t0, t1, tf_filepath=path)` | One file |
 
-```python
-tf_path = store.download(meta.calibration_files(store)[0])   # e.g. 828_160707_B_HARP.tf
-times, freqs, psd, calibrated = extract_spectrum_multiple_files(files, t0, t1, store=store, tf=tf_path)
-```
+`Catalog.calibration_filepath(filename)` returns the local path of the right `.tf` file. With a `GCStore`, it first downloads the file into `downloads/`. A constant `gain_db` offset can be added in all three cases.
 
-For EF_01 this adds about +70 dB between 63 and 500 Hz. Check `meta.quality` for the bands where the calibration is valid.
+For EF_01, the transfer function adds about +70 dB between 63 and 500 Hz. Check `meta.quality` for the bands where the calibration is valid.
 
 ## AIS data notes
 
@@ -184,13 +227,14 @@ For EF_01 this adds about +70 dB between 63 and 500 Hz. Check `meta.quality` for
 
 ## Logging
 
-Each module logs to its own logger: `audio_files` (also used by `signal_treatment`), `deployment_metadata` and `ais_data`. To see progress in a notebook:
+Each module logs to its own logger: `audio_files` (also used by `signal_treatment`), `gc_files` (downloads), `deployment_metadata`, `recording` and `ais_data`. To see progress in a notebook:
 
 ```python
 import logging
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
 logging.getLogger("audio_files").setLevel(logging.INFO)
-logging.getLogger("deployment_metadata").setLevel(logging.INFO)
+for name in ("gc_files", "deployment_metadata", "recording"):
+    logging.getLogger(name).setLevel(logging.INFO)
 logging.getLogger("ais_data").setLevel(logging.INFO)
 ```
 

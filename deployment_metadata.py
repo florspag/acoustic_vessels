@@ -324,8 +324,9 @@ class DeploymentMetadata:
     def calibration_files(self, store: Store) -> list[str]:
         """Calibration transfer-function files (``*.tf``) of this deployment.
 
-        Download one with ``store.download(path)`` and pass the local path as
-        ``tf=`` to the spectrum functions.
+        These are bucket paths. ``recording.Catalog.calibration_filepath``
+        picks the right one and returns a local path, which is easier than
+        downloading one by hand.
         """
         if not self.folder:
             return []

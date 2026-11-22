@@ -38,8 +38,8 @@ def load_calibration(tf_filepath:str, freqs:np.ndarray[float], gain_db:float):
 
     Parameters
     ----------
-    tf_path : str or None
-        Text file with two columns: frequency (Hz) and correction (dB).
+    tf_filepath : str or None
+        Local text file with two columns: frequency (Hz) and correction (dB).
         Lines starting with ``#`` or ``%`` are ignored. Interpolated onto
         ``freqs``.
     freqs : numpy.ndarray
@@ -85,8 +85,9 @@ def extract_spectral_distribution(
         Seconds of audio analysed at the start of each minute.
     fmax : float, default 1000.0
         Highest frequency kept, in Hz.
-    tf : str, optional
-        Calibration file, see :func:`load_calibration`.
+    tf_filepath : str, optional
+        Local calibration file, see :func:`load_calibration`, e.g.
+        ``Catalog.calibration_filepath(audio_file.filename)``.
     gain_db : float, default 0.0
         Constant calibration offset, in dB.
 
@@ -98,7 +99,8 @@ def extract_spectral_distribution(
         Bin frequencies from 1 Hz to ``fmax``; ``None`` if nothing was analysed.
     rows : list[numpy.ndarray]
         One PSD per minute, in dB, aligned with ``freqs``. Calibrated
-        (dB re 1 µPa²/Hz) if ``tf`` or ``gain_db`` is given, else relative.
+        (dB re 1 µPa²/Hz) if ``tf_filepath`` or ``gain_db`` is given, else
+        relative.
     """
 
     # Setup decimation
