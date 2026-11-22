@@ -21,6 +21,7 @@ No credentials are needed. The GCS bucket is public, so `GCStore` uses an anonym
 | `gc_files.py` | `GCStore`: lists, filters and streams files from a GCS bucket. Also the `AudioExtenstion` enum and parsing of timestamps from file names (ISO, HARP and SoundTrap styles). |
 | `audio_files.py` | `AudioFile`: random-access reader over a GCS stream. It parses WAV/RIFF headers and Triton XWAV `harp` chunks (duty-cycled segments, site metadata), so a read fetches only the bytes it needs. FLAC, AIFF and other formats go through `soundfile`. |
 | `signal_treatment.py` | Spectral analysis: decimation, Welch PSD, calibration, band levels, plots, and detection of loud events. |
+| `deployment_metadata.py` | `DeploymentMetadata`: each deployment's metadata JSON (position, depth, deployment and recovery times, sample rate, duty cycle, data-quality periods), plus its calibration files. |
 | `ais_data.py` | `AIS`: downloads and filters daily AIS files from MarineCadastre.gov. `AISData` is one position report, `BBox` a search area. |
 | `vessel.ipynb` | Worked example from start to finish. |
 | `downloads/` | Local copies of audio files fetched with `GCStore.download`, and the AIS cache in `downloads/ais/`. Not tracked in git. |
@@ -97,15 +98,46 @@ events, baseline, excess = acoustic_events(times, lvl, baseline_hours=6, thresh_
 
 The baseline is a centred rolling median of the band level over `baseline_hours`. An event is a run of minutes at least `thresh_db` above that baseline, with gaps of at most 5 minutes, lasting at least `min_minutes`. `events` has one row per event, with `start`, `end`, `peak_time`, `peak_level` and `peak_excess`.
 
+### Deployment metadata
+
+Each deployment folder in the bucket has an `audio/` folder, an `ancillary/` folder (calibration files, LTSAs) and a `metadata/` folder with one JSON file:
+
+```text
+sefsc/audio/gomex/ef/sefsc_gomex_ef_01/
+    audio/GOM_EF_01_160716_170502.x.flac
+    ancillary/calibration/828_160707_B_HARP.tf
+    metadata/SEFSC_GOMx_EF_01.json
+```
+
+```python
+from deployment_metadata import DeploymentMetadata
+
+meta = DeploymentMetadata.for_audio_file(store, files[0])  # finds <deployment>/metadata/*.json
+meta.latitude, meta.longitude      # 27.73308, -92.95133
+meta.instrument_depth              # 241.0 (metres, positive downwards)
+meta.sample_rate_hz                # 2000.0
+meta.is_deployed(t)                # False for deck tests before deployment or after recovery
+meta.quality_at(t, freq_hz=63)     # [QualityPeriod(quality='Good', low_freq=50, high_freq=600, ...)]
+```
+
+`DeploymentMetadata.from_store(store, path)` loads a given JSON instead. Numbers and times stored as text in the JSON are converted, and the sample rate goes from kHz to Hz. The full JSON stays in `meta.raw`, for fields that aren't mapped (abstract, people, ...).
+
+Before analysing a deployment, check two things:
+
+- **Deck tests.** Audio can start days before the instrument reaches the seafloor. For EF_01, audio starts on 2016-07-16 but the deployment is on 2016-07-21 06:00, so the first file was recorded on the ship. Skip any time where `meta.is_deployed(t)` is `False`.
+- **Quality by frequency.** `meta.quality` lists periods and frequency bands rated `Good`, `Unverified` or `Unusable`. For EF_01, calibration is only `Good` from 50 to 600 Hz. The third-octave bands at 63–500 Hz are fine, but the broadband 20–500 Hz band starts in the unverified range.
+
 ### AIS vessel positions
 
 ```python
-from ais_data import AIS, AISData, BBox
+from ais_data import AIS, AISData
 
-box = BBox.around(lat=27.5, lon=-85.4, radius_km=20)   # around the hydrophone
+box = meta.bbox(radius_km=20)                          # around the hydrophone
 ais = AIS().load_ais(t0, t1, bbox=box, workers=2)      # DataFrame, sorted by mmsi then time
 records = AISData.from_frame(ais)                      # list[AISData], if you want objects
 ```
+
+Without metadata, build the box by hand with `BBox.around(lat, lon, radius_km)` from `ais_data`.
 
 `load_ais` downloads every day the window touches. Each day is one zip of about 120 MB for all U.S. waters, cached in `downloads/ais/`. The CSV is then read in chunks of a million rows, keeping only reports inside the box and the time window, so a whole day (700 MB unzipped) never has to fit in memory.
 
@@ -118,7 +150,7 @@ Columns are the `AISData` fields: the MarineCadastre column names in snake_case 
 - **PSD**: Welch's method with a 1 s Hann window and 50 % overlap, which gives 1 Hz bins. The DC offset is removed first. Only bins from 1 Hz to `fmax` are kept, and the result is in dB.
 - **Bands** (`standard_bands`): one broadband 20–500 Hz band, plus the third-octave bands centred on 63, 125, 250 and 500 Hz. These are the ship-noise indicators of the EU Marine Strategy Framework Directive (MSFD). `band_levels` integrates linear power over each band and returns dB. It accepts one spectrum or a 2D `(time, freq)` array.
 
-These settings suit noise monitoring. Telling vessel types apart needs more: continuous audio at the full sample rate around each passage, and frequencies well above 1 kHz, where propeller cavitation is.
+These settings suit noise monitoring. Telling vessel types apart needs more: continuous audio at the full sample rate around each passage, and frequencies well above 1 kHz, where propeller cavitation is. Check `meta.sample_rate_hz` first. EF_01 is recorded at 2 kHz, so 1 kHz is the highest frequency it holds.
 
 ## Calibration
 
@@ -127,9 +159,18 @@ Without calibration, levels are relative: dB re 1 ADC count²/Hz. To get absolut
 - `gain_db`: a constant offset for the whole system.
 - `tf`: the path to a two-column text file (frequency in Hz, correction in dB). The correction is interpolated onto the PSD frequencies.
 
+Each deployment's transfer functions are in its `ancillary/calibration/` folder, named after the hydrophone preamplifier (`meta.preamp_ids`):
+
+```python
+tf_path = store.download(meta.calibration_files(store)[0])   # e.g. 828_160707_B_HARP.tf
+times, freqs, psd, calibrated = extract_spectrum_multiple_files(files, t0, t1, store=store, tf=tf_path)
+```
+
+For EF_01 this adds about +70 dB between 63 and 500 Hz. Check `meta.quality` for the bands where the calibration is valid.
+
 ## AIS data notes
 
-- **Times are UTC.** Check that the audio file-name timestamps are UTC too before matching AIS reports to acoustic events. HARP files normally are.
+- **Times are UTC**, like the SEFSC recordings (the deployment metadata says so), so AIS reports and acoustic events can be compared directly.
 - **"Not available" codes.** AIS (ITU-R M.1371) encodes every field as a fixed-size integer, so a missing value is sent as a reserved code instead of a blank. `load_ais` turns these into NaN:
 
   | Field | Valid range | "Not available" in the source |
@@ -143,12 +184,13 @@ Without calibration, levels are relative: dB re 1 ADC count²/Hz. To get absolut
 
 ## Logging
 
-Each module logs to its own logger: `audio_files` (also used by `signal_treatment`) and `ais_data`. To see progress in a notebook:
+Each module logs to its own logger: `audio_files` (also used by `signal_treatment`), `deployment_metadata` and `ais_data`. To see progress in a notebook:
 
 ```python
 import logging
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
 logging.getLogger("audio_files").setLevel(logging.INFO)
+logging.getLogger("deployment_metadata").setLevel(logging.INFO)
 logging.getLogger("ais_data").setLevel(logging.INFO)
 ```
 
@@ -156,5 +198,5 @@ At INFO you get one summary line per audio file, per-file progress and timing fo
 
 ## Data
 
-- **Audio**: the NOAA Passive Bioacoustic archive on GCS, bucket `noaa-passive-bioacoustic`. The `sefsc/` prefix holds the Southeast Fisheries Science Center recordings, for example the HARP deployments `GOM_EF_01` and `GOM_WF_01` in the Gulf of Mexico.
+- **Audio**: the NOAA Passive Bioacoustic archive on GCS, bucket `noaa-passive-bioacoustic`. The `sefsc/` prefix holds the Southeast Fisheries Science Center recordings, for example the HARP deployments `GOM_EF_01` and `GOM_WF_01` in the Gulf of Mexico. The Gulf of Mexico sites are under `sefsc/audio/gomex/` (`ef`, `ei`, `ep`, `gi`, `wf`), with one folder per deployment.
 - **AIS**: MarineCadastre.gov (NOAA / BOEM), daily files for U.S. waters, at `https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{mm}_{dd}.zip`.

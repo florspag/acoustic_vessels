@@ -5,6 +5,7 @@ naming styles).
 """
 import os
 import re
+import json
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
@@ -163,6 +164,21 @@ class GCStore:
             list(ex.map(fetch, range(0, size, chunk_size)))  # list() surfaces errors
 
         return buf  # bytearray; use bytes(buf) if you need immutable bytes
+
+    def read_json(self, filename: str) -> dict:
+        """Download a JSON blob and parse it.
+
+        Parameters
+        ----------
+        filename : str
+            Full blob name, e.g. a deployment's ``metadata/*.json``.
+
+        Returns
+        -------
+        dict
+            The parsed JSON.
+        """
+        return json.loads(self.bucket.blob(filename).download_as_bytes())
 
     def open_file(self, filename) -> BlobReader:
         """Open a blob as a seekable binary stream.
